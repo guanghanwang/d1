@@ -92,7 +92,7 @@ def main(grpo_config, model_config):
     peft_config = LoraConfig(
         r=model_config.lora_r,
         lora_alpha=model_config.lora_alpha,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj", "gate_proj"],
+        target_modules=["q_proj", "k_proj", "v_proj"],
         task_type="CAUSAL_LM",
         lora_dropout=model_config.lora_dropout,
     )

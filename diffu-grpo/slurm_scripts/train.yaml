@@ -60,7 +60,7 @@ save_total_limit: 500
 max_completion_length: 256
 max_prompt_length: 200
 block_length: 32
-diffusion_steps: 128
+diffusion_steps: 256
 generation_batch_size: 6
 remasking: low_confidence
 random_masking: True

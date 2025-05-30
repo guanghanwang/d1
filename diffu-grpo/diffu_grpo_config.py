@@ -385,3 +385,9 @@ class DiffuGRPOConfig(TrainingArguments):
         default=True,
         metadata={"help": "Whether to randomly mask tokens."},
     )
+    conf_thres: Optional[float] = field(
+        default=0.9,
+    )
+    sampler: Optional[str] = field(
+        default="llada",
+    )

@@ -146,7 +146,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
         noise = torch.rand_like(logits, dtype=dtype)
         gumbel_noise = (-torch.log(noise)) ** temperature
         return logits.exp() / gumbel_noise
-
+    
     def generate(
         self,
         model,
@@ -235,6 +235,96 @@ class DiffuGRPOTrainer(GRPOTrainer):
 
                             x[transfer_index] = x0[transfer_index]
                             del x0, confidence, transfer_index
+            return x
+
+    def fast_dllm_generate(
+        self,
+        model,
+        prompt,
+        steps=128,
+        gen_length=128,
+        block_length=128,
+        temperature=0.0,
+        cfg_scale=0.0,
+        remasking="low_confidence",
+        mask_id=126336,
+        conf_thres=0.9,
+    ):
+        """generation code adopted from llada (https://github.com/ML-GSAI/LLaDA)"""
+        with torch.cuda.amp.autocast(enabled=True):
+            bs = prompt.shape[0]
+            dtype = model.dtype
+            x = torch.full((bs, prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
+            x[:, : prompt.shape[1]] = prompt.clone()
+
+            prompt_index = x != mask_id
+
+            assert gen_length % block_length == 0
+            num_blocks = gen_length // block_length
+
+            for num_block in range(num_blocks):
+                start_idx = prompt.shape[1] + num_block * block_length
+                end_idx = prompt.shape[1] + (num_block + 1) * block_length
+            
+                transfer_indices_record = torch.zeros(bs).to(prompt.device)
+                while torch.sum(transfer_indices_record) < bs * block_length:
+                    torch.cuda.empty_cache()
+                    mask_index = x == mask_id
+
+                    if hasattr(torch.cuda, "amp") and hasattr(torch.cuda.amp, "autocast"):
+                        with torch.cuda.amp.autocast(enabled=self.args.fp16):
+                            # Handle classifier-free guidance more efficiently
+                            if cfg_scale > 0.0:
+                                un_x = x.clone()
+                                un_x[prompt_index] = mask_id
+                                x_ = torch.cat([x, un_x], dim=0)
+
+                                # Get logits in a single forward pass
+                                logits = model(x_).logits
+                                logits, un_logits = torch.chunk(logits, 2, dim=0)
+                                logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
+                            else:
+                                logits = model(x).logits
+
+                            # Apply Gumbel noise for sampling
+                            logits_with_noise = self.add_gumbel_noise(
+                                logits, temperature=temperature, dtype=dtype
+                            )
+                            x0 = torch.argmax(logits_with_noise, dim=-1)
+                            del logits_with_noise
+
+                            # Handle remasking strategy
+                            if remasking == "low_confidence":
+                                p = F.softmax(logits.to(dtype), dim=-1)
+                                x0_p = torch.squeeze(
+                                    torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1
+                                )
+                            elif remasking == "random":
+                                x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
+                            else:
+                                raise NotImplementedError(remasking)
+
+                            # Ensure we don't process tokens beyond the current block
+                            x0_p[:, end_idx:] = -np.inf
+
+                            # Update masked tokens
+                            x0 = torch.where(mask_index, x0, x)
+                            confidence = torch.where(mask_index, x0_p, -np.inf)
+
+                            # Select tokens to transfer based on confidence
+                            transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
+                            for j in range(confidence.shape[0]):
+                                if transfer_indices_record[j] == block_length:
+                                    continue
+                                num_larger_than_thres = torch.sum(confidence[j] > conf_thres).item()
+                                num_transfer = max(1, num_larger_than_thres)
+                                transfer_indices_record[j] += num_transfer
+                                _, select_index = torch.topk(confidence[j], k=num_transfer)
+                                transfer_index[j, select_index] = True
+
+                            x[transfer_index] = x0[transfer_index]
+                            del x0, confidence, transfer_index
+                del transfer_indices_record
 
             return x
 
@@ -414,17 +504,33 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 end_idx = min(i + generation_batch_size, prompt_ids.size(0))
                 batch_prompt_ids = prompt_ids[i:end_idx]
                 batch_prompt_mask = prompt_mask[i:end_idx]
-                batch_prompt_completion_ids = self.generate(
-                    model=unwrapped_model,
-                    prompt=batch_prompt_ids,
-                    steps=steps,
-                    gen_length=gen_length,
-                    block_length=block_length,
-                    temperature=temperature,
-                    cfg_scale=cfg_scale,
-                    remasking=self.args.remasking,
-                    mask_id=self.args.mask_id,
-                )
+                if self.args.sampler == 'fast_dllm':
+                    batch_prompt_completion_ids = self.fast_dllm_generate(
+                        model=unwrapped_model,
+                        prompt=batch_prompt_ids,
+                        steps=steps,
+                        gen_length=gen_length,
+                        block_length=block_length,
+                        temperature=temperature,
+                        cfg_scale=cfg_scale,
+                        remasking=self.args.remasking,
+                        mask_id=self.args.mask_id,
+                        conf_thres=self.args.conf_thres,
+                    )
+                elif self.args.sampler == 'llada':
+                    batch_prompt_completion_ids = self.generate(
+                        model=unwrapped_model,
+                        prompt=batch_prompt_ids,
+                        steps=steps,
+                        gen_length=gen_length,
+                        block_length=block_length,
+                        temperature=temperature,
+                        cfg_scale=cfg_scale,
+                        remasking=self.args.remasking,
+                        mask_id=self.args.mask_id,
+                    )
+                else:
+                    raise NotImplementedError
                 prompt_completion_ids_all.append(batch_prompt_completion_ids)
 
                 del batch_prompt_ids, batch_prompt_mask, batch_prompt_completion_ids
