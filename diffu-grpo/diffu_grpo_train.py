@@ -2,10 +2,10 @@ import torch
 import wandb
 from transformers import AutoTokenizer, AutoModel, BitsAndBytesConfig
 from trl import TrlParser, ModelConfig
-from peft import LoraConfig
+from peft import LoraConfig, PeftModel
 
 # Custom imports
-from diffu_grpo_trainer import DiffuGRPOTrainer
+from diffu_grpo_trainer import DiffuGRPOTrainer, CoDTrainer
 from diffu_grpo_config import DiffuGRPOConfig
 from reward_func import (
     xmlcount_reward_func,
@@ -76,6 +76,9 @@ def main(grpo_config, model_config):
         bnb_4bit_compute_dtype=torch.bfloat16,
     )
 
+    tokenizer = AutoTokenizer.from_pretrained(grpo_config.model_path, trust_remote_code=True)
+    tokenizer.pad_token = tokenizer.eos_token
+
     # Load model and tokenizer
     model = AutoModel.from_pretrained(
         grpo_config.model_path,
@@ -83,9 +86,6 @@ def main(grpo_config, model_config):
         torch_dtype=torch.bfloat16,
         quantization_config=bnb_config,
     ).to(device)
-
-    tokenizer = AutoTokenizer.from_pretrained(grpo_config.model_path, trust_remote_code=True)
-    tokenizer.pad_token = tokenizer.eos_token
     model.config.use_cache = False
 
     # Configure LoRA for parameter-efficient fine-tuning
@@ -96,16 +96,29 @@ def main(grpo_config, model_config):
         task_type="CAUSAL_LM",
         lora_dropout=model_config.lora_dropout,
     )
-    # Initialize and run trainer
-    trainer = DiffuGRPOTrainer(
-        args=grpo_config,
-        model=model,
-        peft_config=peft_config,
-        reward_funcs=reward_functions,
-        train_dataset=train_set,
-    )
 
-    trainer.train()
+    # Initialize and run trainer
+    if grpo_config.sampler == 'cod_fast_dllm':
+        trainer = CoDTrainer(
+            args=grpo_config,
+            model=model,
+            peft_config=peft_config,
+            reward_funcs=reward_functions,
+            train_dataset=train_set,
+        )
+    else:
+        trainer = DiffuGRPOTrainer(
+            args=grpo_config,
+            model=model,
+            peft_config=peft_config,
+            reward_funcs=reward_functions,
+            train_dataset=train_set,
+        )
+
+    if len(grpo_config.checkpoint_path) == 0:
+        trainer.train()
+    else:
+        trainer.train(resume_from_checkpoint=grpo_config.checkpoint_path)
 
 
 if __name__ == "__main__":

@@ -1,2 +1,4 @@
 watch_folder
 diffu-grpo/outputs
+__pycache__
+wandb

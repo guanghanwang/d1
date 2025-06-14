@@ -11,7 +11,7 @@ from trl.extras.profiling import profiling_decorator, profiling_context
 from transformers.utils import is_peft_available
 from torch import nn
 from trl.import_utils import is_rich_available, is_vllm_available
-from accelerate.utils import broadcast_object_list, gather, gather_object, is_peft_model, set_seed
+from accelerate.utils import broadcast_object_list, gather, gather_object, is_peft_model, set_seed, DistributedType
 from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
 from trl.models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
 from trl.trainer.utils import (
@@ -97,6 +97,8 @@ class DiffuGRPOTrainer(GRPOTrainer):
         this_itr_mask_seed = mask_seeds[this_itr_idx]
         input_ids = input_ids.unsqueeze(0)
         per_token_logps = self._get_per_token_logps(model, input_ids, logits_to_keep, [this_itr_mask_seed])
+        # Compute policy entropy
+        entropy = -(per_token_logps * completion_mask).sum() / completion_mask.sum()
         # Compute the KL divergence between the model and the reference model
         if self.beta != 0.0:
             ref_per_token_logps = inputs["ref_per_token_logps"][this_itr_idx].squeeze(0)
@@ -121,6 +123,8 @@ class DiffuGRPOTrainer(GRPOTrainer):
         loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
         # Log the metrics
         mode = "eval" if self.control.should_evaluate else "train"
+
+        self._metrics[mode]["policy_entropy"].append(entropy.item())
 
         if self.beta != 0.0:
             mean_kl = (per_token_kl * completion_mask).sum() / completion_mask.sum()
@@ -251,6 +255,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
         conf_thres=0.9,
     ):
         """generation code adopted from llada (https://github.com/ML-GSAI/LLaDA)"""
+        NFEs = 0
         with torch.cuda.amp.autocast(enabled=True):
             bs = prompt.shape[0]
             dtype = model.dtype
@@ -324,9 +329,10 @@ class DiffuGRPOTrainer(GRPOTrainer):
 
                             x[transfer_index] = x0[transfer_index]
                             del x0, confidence, transfer_index
+                            NFEs += 1
                 del transfer_indices_record
 
-            return x
+            return x, NFEs
 
     def forward_process(self, batch, prompt_index, mask_id, seed=None):
         set_seed(seed)
@@ -498,14 +504,14 @@ class DiffuGRPOTrainer(GRPOTrainer):
 
         with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
             generation_batch_size = self.args.generation_batch_size
-            prompt_completion_ids_all = []
+            prompt_completion_ids_all, logp_per_token_old_all = [], []
             # Process in batches
             for i in range(0, prompt_ids.size(0), generation_batch_size):
                 end_idx = min(i + generation_batch_size, prompt_ids.size(0))
                 batch_prompt_ids = prompt_ids[i:end_idx]
                 batch_prompt_mask = prompt_mask[i:end_idx]
                 if self.args.sampler == 'fast_dllm':
-                    batch_prompt_completion_ids = self.fast_dllm_generate(
+                    batch_prompt_completion_ids, NFEs = self.fast_dllm_generate(
                         model=unwrapped_model,
                         prompt=batch_prompt_ids,
                         steps=steps,
@@ -536,7 +542,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 del batch_prompt_ids, batch_prompt_mask, batch_prompt_completion_ids
                 torch.cuda.empty_cache()
 
-            prompt_completion_ids = torch.cat(prompt_completion_ids_all, dim=0)
+            prompt_completion_ids = torch.cat(prompt_completion_ids_all, dim=0)    # (G, seq_len)
 
         # Compute prompt length and extract completion ids
         prompt_length = prompt_ids.size(1)
@@ -657,6 +663,9 @@ class DiffuGRPOTrainer(GRPOTrainer):
         # Log the metrics
         mode = "eval" if self.control.should_evaluate else "train"
 
+        if self.args.sampler == 'fast_dllm':
+            self._metrics[mode]["NFEs"].append(NFEs)
+
         completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
         self._metrics[mode]["completion_length"].append(completion_length)
         self._metrics[mode]["zero_std_ratio"].append(zero_std_ratio)
@@ -710,4 +719,510 @@ class DiffuGRPOTrainer(GRPOTrainer):
             "ref_per_token_logps": all_ref_per_token_logps,
             "advantages": advantages,
             "mask_seeds": mask_seeds,  # Store all mask seeds for consistent mask patterns
+        }
+    
+
+class CoDTrainer(GRPOTrainer):
+    """
+    Group Relative Policy Optimization (GRPO) Trainer for Diffusion Language Models.
+
+    This class extends the GRPOTrainer to adapt it for masked diffusion language models,
+    implementing efficient policy gradient estimation through conditional probabilities
+    with masked tokens.
+
+    Key features:
+    - Random masking for improved robustness in multiple policy optimization updates
+    - Efficient computation of per-token log probabilities for diffusion models
+    - Specialized generation process for diffusion models with iterative denoising
+    """
+
+    def __init__(
+        self,
+        model: Union[str, PreTrainedModel],
+        reward_funcs: Union[RewardFunc, list[RewardFunc]],
+        args: Optional[GRPOConfig] = None,
+        train_dataset: Optional[Union[Dataset, IterableDataset]] = None,
+        eval_dataset: Optional[
+            Union[Dataset, IterableDataset, dict[str, Union[Dataset, IterableDataset]]]
+        ] = None,
+        processing_class: Optional[PreTrainedTokenizerBase] = None,
+        reward_processing_classes: Optional[
+            Union[PreTrainedTokenizerBase, list[PreTrainedTokenizerBase]]
+        ] = None,
+        callbacks: Optional[list[TrainerCallback]] = None,
+        optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (
+            None,
+            None,
+        ),
+        peft_config: Optional["PeftConfig"] = None,
+    ):
+        # Initialize the parent class
+        super().__init__(
+            model=model,
+            reward_funcs=reward_funcs,
+            args=args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            processing_class=processing_class,
+            reward_processing_classes=reward_processing_classes,
+            callbacks=callbacks,
+            optimizers=optimizers,
+            peft_config=peft_config,
+        )
+
+    @profiling_decorator
+    def compute_loss_cod(self, model, trajectory, old_per_token_logps, loss_compute_batch_size=12, mask_id=126336):
+        trajectory_shifted = trajectory.clone()[:, 1:]
+        trajectory = trajectory[:, :-1]
+        mask = (trajectory == mask_id) & (trajectory_shifted != mask_id)
+
+        per_token_logp_all = []
+        for i in range(0, trajectory.size(0), loss_compute_batch_size):
+            print(i)
+            end_idx = min(i + loss_compute_batch_size, trajectory.size(0))
+            trajectory_batch = trajectory[i:end_idx]
+            mask_batch = mask[i:end_idx]
+
+            logits = model(trajectory_batch).logits
+            p = F.softmax(logits.to(torch.bfloat16), dim=-1)
+            x0_p = torch.squeeze(torch.gather(p, dim=-1, index=torch.unsqueeze(trajectory_batch, -1)), -1)
+            per_token_p_batch = torch.where(mask_batch, x0_p, 0)
+            assert torch.max(torch.sum(per_token_p_batch > 0, dim=1)) <= 1
+            per_token_logp_batch = torch.sum(per_token_p_batch, dim=1, keepdim=True)[0].log()
+            per_token_logp_all.append(per_token_logp_batch)
+
+        per_token_logps_cat = torch.cat(per_token_logp_all, dim=0)
+        assert torch.max(torch.sum(per_token_logps_cat > 0, dim=1)) <= 1
+        per_token_logps = torch.sum(per_token_logps_cat, dim=1, keepdim=True)[0]
+
+        print(per_token_logps.shape, per_token_logps)
+        print(old_per_token_logps.shape, old_per_token_logps)
+        assert False
+
+        return torch.ones(1, device = trajectory.device)
+    
+    def training_step(
+        self, model: nn.Module, inputs: dict[str, Union[torch.Tensor, Any]], num_items_in_batch=None
+    ) -> torch.Tensor:
+        """
+        Perform a training step on a batch of inputs.
+
+        Subclass and override to inject custom behavior.
+
+        Args:
+            model (`nn.Module`):
+                The model to train.
+            inputs (`Dict[str, Union[torch.Tensor, Any]]`):
+                The inputs and targets of the model.
+
+                The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
+                argument `labels`. Check your model's documentation for all accepted arguments.
+
+        Return:
+            `torch.Tensor`: The tensor with training loss on this batch.
+        """
+        model.train()
+        if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
+            self.optimizer.train()
+
+        inputs = self._prepare_inputs(inputs)
+        old_per_token_logps = inputs['old_per_token_logps']
+        trajectory = inputs['trajectory']
+        bs = trajectory.shape[0]
+
+        losses = []
+        with self.compute_loss_context_manager():
+            for i in range(bs):
+                trajectory_batch = trajectory[i]
+                old_per_token_logps_batch = old_per_token_logps[i].unsqueeze(0)
+                loss_batch = self.compute_loss_cod(model, trajectory_batch, old_per_token_logps_batch)
+                losses.append(loss_batch)
+                loss = torch.cat(losses).mean()
+                print(loss)
+                assert False
+
+        del inputs
+        if (
+            self.args.torch_empty_cache_steps is not None
+            and self.state.global_step % self.args.torch_empty_cache_steps == 0
+        ):
+            if is_torch_xpu_available():
+                torch.xpu.empty_cache()
+            elif is_torch_mlu_available():
+                torch.mlu.empty_cache()
+            elif is_torch_musa_available():
+                torch.musa.empty_cache()
+            elif is_torch_npu_available():
+                torch.npu.empty_cache()
+            elif is_torch_mps_available():
+                torch.mps.empty_cache()
+            elif is_torch_hpu_available():
+                logger.warning(
+                    "`torch_empty_cache_steps` is set but HPU device/backend does not support empty_cache()."
+                )
+            else:
+                torch.cuda.empty_cache()
+
+        kwargs = {}
+
+        # For LOMO optimizers you need to explicitly use the learnign rate
+        if self.args.optim in [OptimizerNames.LOMO, OptimizerNames.ADALOMO]:
+            kwargs["learning_rate"] = self._get_learning_rate()
+
+        if self.args.n_gpu > 1:
+            loss = loss.mean()  # mean() to average on multi-gpu parallel training
+
+        if self.use_apex:
+            from apex import amp
+
+            with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                scaled_loss.backward()
+        else:
+            # Finally we need to normalize the loss for reporting if GA loss bug is not fixed during compute loss
+            if not self.model_accepts_loss_kwargs and self.compute_loss_func is None:
+                loss = loss / self.args.gradient_accumulation_steps
+
+            # Turning off loss scaling w.r.t. gradient accumulation when DeepSpeed is enabled
+            # https://github.com/huggingface/transformers/pull/35808
+            if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
+                kwargs["scale_wrt_gas"] = False
+
+            self.accelerator.backward(loss, **kwargs)
+
+            return loss.detach()
+
+    def add_gumbel_noise(self, logits, temperature, dtype):
+        """
+        The Gumbel max is a method for sampling categorical distributions.
+        According to arXiv:2409.02908, for MDM, low-precision Gumbel Max improves perplexity score but reduces generation quality.
+        Thus, we use float64.
+        """
+        if temperature == 0.0:
+            return logits  # Skip noise when temperature is 0
+        logits = logits.to(dtype)
+        noise = torch.rand_like(logits, dtype=dtype)
+        gumbel_noise = (-torch.log(noise)) ** temperature
+        return logits.exp() / gumbel_noise
+        
+    def cod_fast_dllm_generate(
+        self,
+        model,
+        prompt,
+        steps=128,
+        gen_length=128,
+        block_length=128,
+        temperature=0.0,
+        cfg_scale=0.0,
+        remasking="low_confidence",
+        mask_id=126336,
+        conf_thres=0.9,
+    ):
+        """generation code adopted from llada (https://github.com/ML-GSAI/LLaDA)"""
+        with torch.cuda.amp.autocast(enabled=True):
+            bs = prompt.shape[0]
+            dtype = model.dtype
+            x = torch.full((bs, prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
+            x[:, : prompt.shape[1]] = prompt.clone()
+
+            prompt_index = x != mask_id
+
+            assert gen_length % block_length == 0
+            num_blocks = gen_length // block_length
+
+            trajectory = [x.clone().unsqueeze(1)]
+            per_token_logps = torch.zeros_like(x).to(torch.bfloat16)
+            for num_block in range(num_blocks):
+                end_idx = prompt.shape[1] + (num_block + 1) * block_length
+            
+                transfer_indices_record = torch.zeros(bs).to(prompt.device)
+                while torch.sum(transfer_indices_record) < bs * block_length:
+                    torch.cuda.empty_cache()
+                    mask_index = x == mask_id
+
+                    if hasattr(torch.cuda, "amp") and hasattr(torch.cuda.amp, "autocast"):
+                        with torch.cuda.amp.autocast(enabled=self.args.fp16):
+                            # Handle classifier-free guidance more efficiently
+                            if cfg_scale > 0.0:
+                                un_x = x.clone()
+                                un_x[prompt_index] = mask_id
+                                x_ = torch.cat([x, un_x], dim=0)
+
+                                # Get logits in a single forward pass
+                                logits = model(x_).logits
+                                logits, un_logits = torch.chunk(logits, 2, dim=0)
+                                logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
+                            else:
+                                logits = model(x).logits
+
+                            # Apply Gumbel noise for sampling
+                            logits_with_noise = self.add_gumbel_noise(
+                                logits, temperature=temperature, dtype=dtype
+                            )
+                            x0 = torch.argmax(logits_with_noise, dim=-1)
+                            del logits_with_noise
+
+                            # Handle remasking strategy
+                            if remasking == "low_confidence":
+                                p = F.softmax(logits.to(dtype), dim=-1)
+                                x0_p = torch.squeeze(
+                                    torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1
+                                )
+                            elif remasking == "random":
+                                x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
+                            else:
+                                raise NotImplementedError(remasking)
+
+                            # Ensure we don't process tokens beyond the current block
+                            x0_p[:, end_idx:] = -np.inf
+
+                            # Update masked tokens
+                            x0 = torch.where(mask_index, x0, x)
+                            confidence = torch.where(mask_index, x0_p, -np.inf)
+
+                            # Select tokens to transfer based on confidence
+                            transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
+                            for j in range(confidence.shape[0]):
+                                if transfer_indices_record[j] == block_length:
+                                    continue
+                                num_larger_than_thres = torch.sum(confidence[j] > conf_thres).item()
+                                num_transfer = max(1, num_larger_than_thres)
+                                transfer_indices_record[j] += num_transfer
+                                _, select_index = torch.topk(confidence[j], k=num_transfer)
+                                transfer_index[j, select_index] = True
+
+                            x[transfer_index] = x0[transfer_index]
+                            per_token_logps[transfer_index] = confidence.clone().log()[transfer_index]
+                            trajectory.append(x.clone().unsqueeze(1))
+                            del x0, confidence, transfer_index, select_index
+                del transfer_indices_record
+
+            return x, trajectory, per_token_logps[:, prompt.shape[1]:].to(torch.float32)
+
+    def _prepare_inputs(
+        self, inputs: dict[str, Union[torch.Tensor, Any]]
+    ) -> dict[str, Union[torch.Tensor, Any]]:
+        mode = "eval" if self.control.should_evaluate else "train"
+        if mode == "train":
+            if self.state.global_step % self.num_iterations == 0:
+                inputs = self._generate_and_score_completions(inputs)
+                self._buffered_inputs[self._step % self.args.gradient_accumulation_steps] = inputs
+            else:
+                inputs = self._buffered_inputs[self._step % self.args.gradient_accumulation_steps]
+            self._step += 1
+        else:
+            # In evaluation, we don't reuse completions across multiple updates, so we don't need to buffer inputs.
+            inputs = self._generate_and_score_completions(inputs)
+        return inputs
+
+    def _generate_and_score_completions(
+        self, inputs: dict[str, Union[torch.Tensor, Any]]
+    ) -> dict[str, Union[torch.Tensor, Any]]:
+        device = self.accelerator.device
+
+        prompts = [x["prompt"] for x in inputs]
+        prompts_text = [
+            maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs
+        ]
+        prompt_inputs = self.processing_class(
+            text=prompts_text,
+            return_tensors="pt",
+            padding=True,
+            padding_side="left",
+            add_special_tokens=False,
+        )
+        prompt_inputs = Trainer._prepare_inputs(self, prompt_inputs)
+        prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
+
+        if self.max_prompt_length is not None:
+            prompt_ids = prompt_ids[:, -self.max_prompt_length :]
+            prompt_mask = prompt_mask[:, -self.max_prompt_length :]
+
+        # Configuration for the diffusion generation
+        gen_length = self.args.max_completion_length
+        block_length = self.args.block_length
+        steps = self.args.diffusion_steps
+        temperature = self.args.temperature or 0.0
+        cfg_scale = self.args.cfg_scale
+
+        with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
+            generation_batch_size = self.args.generation_batch_size
+            prompt_completion_ids_all = []
+            # Process in batches
+            for i in range(0, prompt_ids.size(0), generation_batch_size):
+                end_idx = min(i + generation_batch_size, prompt_ids.size(0))
+                batch_prompt_ids = prompt_ids[i:end_idx]
+                batch_prompt_mask = prompt_mask[i:end_idx]
+                
+                with torch.no_grad():
+                    batch_prompt_completion_ids, trajectory, per_token_logps = self.cod_fast_dllm_generate(
+                        model=unwrapped_model,
+                        prompt=batch_prompt_ids,
+                        steps=steps,
+                        gen_length=gen_length,
+                        block_length=block_length,
+                        temperature=temperature,
+                        cfg_scale=cfg_scale,
+                        remasking=self.args.remasking,
+                        mask_id=self.args.mask_id,
+                        conf_thres=self.args.conf_thres,
+                    )
+               
+                prompt_completion_ids_all.append(batch_prompt_completion_ids)
+
+                del batch_prompt_ids, batch_prompt_mask, batch_prompt_completion_ids
+                torch.cuda.empty_cache()
+
+            prompt_completion_ids = torch.cat(prompt_completion_ids_all, dim=0)    # (G, seq_len)
+
+        # Merge trajectory
+        trajectory = torch.cat(trajectory, dim=1)
+        NFEs = trajectory.shape[1]
+
+        # Compute prompt length and extract completion ids
+        prompt_length = prompt_ids.size(1)
+        prompt_ids = prompt_completion_ids[:, :prompt_length]
+        completion_ids = prompt_completion_ids[:, prompt_length:]
+
+        # Mask everything after the first EOS token
+        is_eos = completion_ids == self.processing_class.eos_token_id
+        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
+        eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
+        sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
+        completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+        logits_to_keep = completion_ids.size(1)  
+
+        with torch.no_grad():
+            if self.num_iterations > 1:
+                all_old_per_token_logps = per_token_logps
+            else:
+                all_old_per_token_logps = None
+        
+        completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+        if is_conversational(inputs[0]):
+            completions = []
+            for prompt, completion in zip(prompts, completions_text):
+                bootstrap = prompt.pop()["content"] if prompt[-1]["role"] == "assistant" else ""
+                completions.append([{"role": "assistant", "content": bootstrap + completion}])
+        else:
+            completions = completions_text
+
+        rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
+        for i, (reward_func, reward_processing_class) in enumerate(
+            zip(self.reward_funcs, self.reward_processing_classes)
+        ):
+            if isinstance(
+                reward_func, nn.Module
+            ):  # Module instead of PretrainedModel for compat with compiled models
+                reward_func_name = f"reward {reward_func.config._name_or_path.split('/')[-1]}"
+            else:
+                reward_func_name = reward_func.__name__
+            with profiling_context(self, reward_func_name):
+
+                # Repeat all input columns (but "prompt" and "completion") to match the number of generations
+                keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
+                reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
+                output_reward_func = reward_func(
+                    prompts=prompts,
+                    completions=completions,
+                    step=self._step,
+                    run_name=self.args.output_dir,
+                    **reward_kwargs,
+                )
+                # Convert None values to NaN
+                output_reward_func = [
+                    reward if reward is not None else torch.nan for reward in output_reward_func
+                ]
+
+                rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+
+        # If all reward functions return None for a given row, issue a detailed warning
+        if torch.isnan(rewards_per_func).all(dim=1).any():
+            nan_row_idx = torch.isnan(rewards_per_func).all(dim=1).nonzero(as_tuple=True)[0][0]
+            row_reward_kwargs = {key: value[nan_row_idx] for key, value in reward_kwargs.items()}
+            row_reward_kwargs["prompt"] = prompts[nan_row_idx]
+            row_reward_kwargs["completion"] = completions[nan_row_idx]
+            warnings.warn(
+                f"All reward functions returned None for the following kwargs: {row_reward_kwargs}. "
+                "Please ensure that at least one reward function returns a valid reward."
+            )
+
+        rewards_per_func = gather(rewards_per_func)
+        rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
+
+        # Compute grouped-wise rewards
+        mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
+        std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
+
+        # Normalize the rewards to compute the advantages
+        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+        std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+        advantages = rewards - mean_grouped_rewards
+        # Count prompts with zero std deviation
+        zero_std_count = (std_grouped_rewards < 1e-6).sum().item()  # Using a small threshold
+        total_prompts = std_grouped_rewards.size(0)
+        zero_std_ratio = zero_std_count / total_prompts if total_prompts > 0 else 0.0
+
+        process_slice = slice(
+            self.accelerator.process_index * len(prompts),
+            (self.accelerator.process_index + 1) * len(prompts),
+        )
+        advantages = advantages[process_slice]
+
+        # Log the metrics
+        mode = "eval" if self.control.should_evaluate else "train"
+
+        self._metrics[mode]["NFEs"].append(NFEs)
+
+        completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
+        self._metrics[mode]["completion_length"].append(completion_length)
+        self._metrics[mode]["zero_std_ratio"].append(zero_std_ratio)
+
+        # Calculate mean reward per function, but only for samples where the function was applied
+        for i, reward_func in enumerate(self.reward_funcs):
+            if isinstance(
+                reward_func, nn.Module
+            ):  # Module instead of PretrainedModel for compat with compiled models
+                reward_func_name = reward_func.config._name_or_path.split("/")[-1]
+            else:
+                reward_func_name = reward_func.__name__
+            # Only calculate mean for samples where this reward function was applied (non-NaN values)
+            mean_rewards = torch.nanmean(rewards_per_func[:, i]).item()
+            self._metrics[mode][f"rewards/{reward_func_name}"].append(mean_rewards)
+        self._metrics[mode]["reward"].append(rewards.mean().item())
+        self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
+
+        if self.log_completions and self.state.global_step % self.args.logging_steps == 0:
+            prompts_to_log = gather_object(prompts_text)
+            completions_to_log = gather_object(completions_text)
+            rewards_to_log = rewards.tolist()
+
+            if self.accelerator.is_main_process:
+                if is_rich_available():
+                    print_prompt_completions_sample(
+                        prompts_to_log,
+                        completions_to_log,
+                        rewards_to_log,
+                        self.state.global_step,
+                    )
+                if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
+                    import pandas as pd
+
+                    # For logging
+                    table = {
+                        "step": [str(self.state.global_step)] * len(rewards),
+                        "prompt": prompts_to_log,
+                        "completion": completions_to_log,
+                        "reward": rewards.tolist(),
+                    }
+                    df = pd.DataFrame(table)
+                    wandb.log({"completions": wandb.Table(dataframe=df)})
+
+        return {
+            "prompt_ids": prompt_ids,
+            "prompt_mask": prompt_mask,
+            "completion_ids": completion_ids,
+            "completion_mask": completion_mask,
+            "old_per_token_logps": all_old_per_token_logps,
+            "advantages": advantages,
+            "trajectory": trajectory,
         }

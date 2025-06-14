@@ -167,6 +167,9 @@ class DiffuGRPOConfig(TrainingArguments):
     model_path: Optional[str] = field(
         default="",
     )
+    checkpoint_path: Optional[str] = field(
+        default="",
+    )
 
     num_generations: Optional[int] = field(
         default=8,
@@ -390,4 +393,7 @@ class DiffuGRPOConfig(TrainingArguments):
     )
     sampler: Optional[str] = field(
         default="llada",
+    )
+    use_weighted_elbo: Optional[bool] = field(
+        default=True,
     )
